@@ -100,6 +100,9 @@ def test_default_config(test_config: Settings, test_database_path: str) -> None:
                 "auth_file_path": AUTH_FILE.as_posix(),
                 "jqls": [],
                 "active_jql": 1,
+                "request_timeout": 30.0,
+                "page_size": 100,
+                "snapshot_cache_path": "",
             },
         },
     }

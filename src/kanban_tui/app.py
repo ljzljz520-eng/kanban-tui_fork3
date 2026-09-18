@@ -21,6 +21,7 @@ from kanban_tui.config import (
     init_config,
 )
 from kanban_tui.modal.modal_auth_screen import ModalAuthScreen
+from kanban_tui.refresh_state import RefreshPhase, RefreshState
 from kanban_tui.screens.board_screen import BoardScreen
 from kanban_tui.screens.overview_screen import OverViewScreen
 from kanban_tui.screens.settings_screen import SettingsScreen
@@ -56,6 +57,7 @@ class KanbanTui(App[str | None]):
     board_list: reactive[list[Board]] = reactive([], init=False)
     column_list: reactive[list[Column]] = reactive([], init=False)
     active_board: reactive[Board | None] = reactive(None, init=False)
+    refresh_state: reactive[RefreshState] = reactive(RefreshState(), init=False)
 
     def __init__(
         self,
@@ -74,6 +76,9 @@ class KanbanTui(App[str | None]):
         self.auth_only = auth_only
         self.backend = self.get_backend()
         self.auto_refresh_timer: Timer | None = None
+        # Monotonic token bumped by every refresh; stale workers compare
+        # their captured generation against it before publishing.
+        self._refresh_generation = 0
 
     def get_backend(self):
         match self.config.backend.mode:
@@ -258,8 +263,52 @@ class KanbanTui(App[str | None]):
         self.needs_refresh = True
         self.get_screen("board", BoardScreen).load_kanban_board()
 
+    def begin_refresh(self, board_id: int) -> int:
+        """Start a new refresh generation and broadcast the loading state."""
+        self._refresh_generation += 1
+        self.refresh_state = RefreshState(
+            phase=RefreshPhase.LOADING,
+            message="Loading Jira issues\u2026",
+            board_id=board_id,
+            generation=self._refresh_generation,
+        )
+        return self._refresh_generation
+
+    def is_refresh_current(self, generation: int, board_id: int) -> bool:
+        """True if this generation may still publish for the active board."""
+        return (
+            generation == self._refresh_generation
+            and self.active_board is not None
+            and self.active_board.board_id == board_id
+        )
+
+    def settle_refresh(
+        self,
+        generation: int,
+        board_id: int,
+        phase: RefreshPhase,
+        message: str = "",
+    ) -> bool:
+        """Transition the refresh state unless a newer generation owns it."""
+        if self._refresh_generation > generation:
+            return False
+        if self.active_board is not None and self.active_board.board_id != board_id:
+            return False
+        self.refresh_state = RefreshState(
+            phase=phase,
+            message=message,
+            board_id=board_id,
+            generation=generation,
+        )
+        return True
+
     def update_task_list(self):
-        self.task_list = self.backend.get_tasks_on_active_board()
+        if self.config.backend.mode == Backends.JIRA:
+            # Never block the event loop here: serve the last-known-good
+            # snapshot (or an empty list); the board worker refreshes Jira.
+            self.task_list = self.backend.get_cached_active_tasks()
+        else:
+            self.task_list = self.backend.get_tasks_on_active_board()
 
     def update_column_list(self):
         self.column_list = self.backend.get_columns()

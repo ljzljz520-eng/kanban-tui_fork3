@@ -1,22 +1,37 @@
+from __future__ import annotations
+
+import json
+import logging
+import os
+import threading
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import UTC, datetime
+from pathlib import Path
 
 from atlassian import Jira
+from pydantic import ValidationError
 
 from kanban_tui.backends.auth import AuthSettings, init_auth_file
 from kanban_tui.backends.base import Backend
 from kanban_tui.backends.jira.jira_api import (
+    JiraTransportError,
+    SearchOptions,
     authenticate_to_jira,
-    get_jql,
+    get_issue_state,
     get_transitions,
+    search_issues_paged,
+    search_issues_paged_async,
     set_issue_status,
 )
-from kanban_tui.backends.jira.models import JiraIssue
+from kanban_tui.backends.jira.models import JiraBoardSnapshot, JiraIssue
 from kanban_tui.classes.board import Board
 from kanban_tui.classes.category import Category
 from kanban_tui.classes.column import Column
 from kanban_tui.classes.task import Task
 from kanban_tui.config import JiraBackendSettings, JqlEntry
+from kanban_tui.constants import DATA_DIR
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -29,20 +44,206 @@ class JiraBackend(Backend):
         init_auth_file(self.settings.auth_file_path)
         self.auth_settings = AuthSettings()
         self.get_authentication()
+        # board_id -> last-known-good, fully verified snapshot
+        self._snapshots: dict[int, JiraBoardSnapshot] = {}
+        self._cache_lock = threading.Lock()
+        self._cache_dir = Path(
+            self.settings.snapshot_cache_path or (DATA_DIR / "jira_snapshots")
+        )
 
     def get_authentication(self):
         self.auth = authenticate_to_jira(
-            self.settings.base_url, self.api_key, self.cert_path
+            self.settings.base_url,
+            self.api_key,
+            self.cert_path,
+            timeout=self.settings.request_timeout,
         )
+
+    # ------------------------------------------------------------------
+    # Snapshot transport / publishing
+    # ------------------------------------------------------------------
+
+    def _search_options(self) -> SearchOptions:
+        return SearchOptions(
+            page_size=self.settings.page_size,
+            request_timeout=self.settings.request_timeout,
+        )
+
+    def _get_jql_entry(self, board_id: int) -> JqlEntry:
+        entry = next(
+            (entry for entry in self.settings.jqls if entry.id == board_id), None
+        )
+        if entry is None:
+            raise ValueError(f"No JQL board configured for board_id={board_id}")
+        return entry
+
+    @staticmethod
+    def _snapshot_matches(snapshot: JiraBoardSnapshot, entry: JqlEntry) -> bool:
+        return (
+            snapshot.jql == entry.jql
+            and dict(snapshot.column_mapping) == dict(entry.column_mapping)
+        )
+
+    def _build_snapshot(self, entry: JqlEntry, result) -> JiraBoardSnapshot:
+        """Convert a verified paged result into an immutable snapshot.
+
+        Dependency resolution runs over the *complete* issue set, so links
+        crossing server page boundaries are resolved as well.
+        """
+        issues = list(result.issues)
+        tasks = [
+            self._jira_issue_to_task(issue_data, board_id=entry.id)
+            for issue_data in issues
+        ]
+        unresolved_link_count = self._resolve_issue_dependencies(tasks, issues)
+        return JiraBoardSnapshot(
+            board_id=entry.id,
+            jql=entry.jql,
+            column_mapping=dict(entry.column_mapping),
+            tasks=tuple(tasks),
+            total=result.total,
+            pages_fetched=result.pages_fetched,
+            watermark=result.watermark,
+            fetched_at=datetime.now(),
+            unresolved_link_count=unresolved_link_count,
+        )
+
+    def _publish_snapshot(self, snapshot: JiraBoardSnapshot) -> None:
+        """Atomically publish a complete snapshot to memory and disk cache."""
+        with self._cache_lock:
+            self._snapshots[snapshot.board_id] = snapshot
+        self._persist_snapshot(snapshot)
+
+    def refresh_board_snapshot(
+        self, board_id: int, *, is_cancelled=None
+    ) -> JiraBoardSnapshot:
+        """Fetch and verify all pages, then publish a snapshot.
+
+        Raises a :class:`JiraTransportError` subclass on failure. A failed
+        refresh never replaces the previously published last-known-good
+        snapshot.
+        """
+        entry = self._get_jql_entry(board_id)
+        result = search_issues_paged(
+            self.auth,
+            entry.jql,
+            self._search_options(),
+            is_cancelled=is_cancelled,
+        )
+        snapshot = self._build_snapshot(entry, result)
+        self._publish_snapshot(snapshot)
+        return snapshot
+
+    async def arefresh_board(self, board_id: int) -> JiraBoardSnapshot:
+        """Async refresh path for the Textual worker (cancellable)."""
+        entry = self._get_jql_entry(board_id)
+        result = await search_issues_paged_async(
+            self.auth, entry.jql, self._search_options()
+        )
+        snapshot = self._build_snapshot(entry, result)
+        self._publish_snapshot(snapshot)
+        return snapshot
+
+    # ------------------------------------------------------------------
+    # Last-known-good cache (memory + optional disk)
+    # ------------------------------------------------------------------
+
+    def _cache_file(self, board_id: int) -> Path:
+        return self._cache_dir / f"jira_snapshot_board_{board_id}.json"
+
+    def _persist_snapshot(self, snapshot: JiraBoardSnapshot) -> None:
+        try:
+            cache_dir = self._cache_dir
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            payload = {
+                "board_id": snapshot.board_id,
+                "jql": snapshot.jql,
+                "column_mapping": dict(snapshot.column_mapping),
+                "total": snapshot.total,
+                "pages_fetched": snapshot.pages_fetched,
+                "watermark": snapshot.watermark.isoformat()
+                if snapshot.watermark
+                else None,
+                "fetched_at": snapshot.fetched_at.isoformat(),
+                "unresolved_link_count": snapshot.unresolved_link_count,
+                "tasks": [task.model_dump(mode="json") for task in snapshot.tasks],
+            }
+            target = self._cache_file(snapshot.board_id)
+            tmp_file = target.with_suffix(".tmp")
+            tmp_file.write_text(json.dumps(payload), encoding="utf-8")
+            os.replace(tmp_file, target)
+        except OSError:
+            logger.debug("Could not persist Jira snapshot cache", exc_info=True)
+
+    def _load_disk_snapshot(self, entry: JqlEntry) -> JiraBoardSnapshot | None:
+        path = self._cache_file(entry.id)
+        if not path.exists():
+            return None
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            if payload.get("jql") != entry.jql:
+                return None
+            if dict(payload.get("column_mapping") or {}) != dict(
+                entry.column_mapping
+            ):
+                return None
+            tasks = tuple(
+                Task.model_validate(item) for item in payload.get("tasks", [])
+            )
+            watermark = payload.get("watermark")
+            watermark_dt = datetime.fromisoformat(watermark) if watermark else None
+            return JiraBoardSnapshot(
+                board_id=entry.id,
+                jql=entry.jql,
+                column_mapping=dict(entry.column_mapping),
+                tasks=tasks,
+                total=payload.get("total"),
+                pages_fetched=int(payload.get("pages_fetched", 0)),
+                watermark=watermark_dt,
+                fetched_at=datetime.fromisoformat(payload["fetched_at"]),
+                unresolved_link_count=int(payload.get("unresolved_link_count", 0)),
+            )
+        except (OSError, ValueError, KeyError, ValidationError):
+            logger.debug("Ignoring unreadable Jira snapshot cache %s", path)
+            return None
+
+    def get_cached_snapshot(self, board_id: int) -> JiraBoardSnapshot | None:
+        """Return the last-known-good snapshot without touching the network."""
+        with self._cache_lock:
+            snapshot = self._snapshots.get(board_id)
+        if snapshot is not None:
+            return snapshot
+
+        entry = next(
+            (entry for entry in self.settings.jqls if entry.id == board_id), None
+        )
+        if entry is None:
+            return None
+        snapshot = self._load_disk_snapshot(entry)
+        if snapshot is not None:
+            with self._cache_lock:
+                self._snapshots.setdefault(board_id, snapshot)
+        return snapshot
+
+    def get_cached_tasks(self, board_id: int) -> list[Task]:
+        snapshot = self.get_cached_snapshot(board_id)
+        return list(snapshot.tasks) if snapshot is not None else []
+
+    def get_cached_active_tasks(self) -> list[Task]:
+        return self.get_cached_tasks(self.settings.active_jql)
+
+    def invalidate_snapshot(self, board_id: int) -> None:
+        with self._cache_lock:
+            self._snapshots.pop(board_id, None)
+        try:
+            self._cache_file(board_id).unlink(missing_ok=True)
+        except OSError:
+            logger.debug("Could not remove snapshot cache", exc_info=True)
 
     # Queries
     def get_boards(self) -> list[Board]:
         """Return a virtual board representing the active JQL query results"""
         if not self.settings.jqls:
-            return []
-
-        active_jql_entry = self._get_active_jql_entry()
-        if not active_jql_entry:
             return []
 
         # Create a virtual board from the JQL query
@@ -64,23 +265,29 @@ class JiraBackend(Backend):
         return []
 
     def get_board_infos(self) -> list[dict]:
-        """Return info about the virtual Jira boards"""
+        """Return info about the virtual Jira boards.
+
+        Purely cache/local-data based: opening the board overview must not
+        trigger one blocking JQL query per board. Boards without a
+        last-known-good snapshot report ``None`` counts instead of fetching.
+        """
         boards = self.get_boards()
         if not boards:
             return []
 
         board_infos = []
-
         for board in boards:
-            board_tasks = self.get_tasks_by_board_id(board_id=board.board_id)
+            snapshot = self.get_cached_snapshot(board.board_id)
+            board_tasks = list(snapshot.tasks) if snapshot is not None else []
 
             board_info_dict = {
                 "board_id": board.board_id,
-                "amount_tasks": len(board_tasks),
+                "amount_tasks": len(board_tasks) if snapshot is not None else None,
                 "amount_columns": len(self.get_columns(board_id=board.board_id)),
                 "next_due": min(
                     (t.due_date for t in board_tasks if t.due_date), default=None
                 ),
+                "stale": snapshot is None,
             }
             board_infos.append(board_info_dict)
 
@@ -91,6 +298,8 @@ class JiraBackend(Backend):
         # Create columns from unique status-to-column mappings
         if not board_id and self.active_board:
             board_id = self.active_board.board_id
+        if board_id is None:
+            return []
 
         # Get the column mapping for this specific board
         status_column_map = self._get_column_mapping_for_board(board_id)
@@ -117,27 +326,42 @@ class JiraBackend(Backend):
         )
 
     def get_tasks_by_board_id(self, board_id: int) -> list[Task]:
-        """Execute active JQL query and convert issues to Tasks"""
+        """Return the board's tasks, refreshing the snapshot when needed.
 
-        board_jql_entry = next(
-            entry for entry in self.settings.jqls if entry.id == board_id
+        Serves last-known-good on transport failures instead of raising, so
+        a rate limited/offline Jira never wipes the rendered board.
+        """
+        entry = self._get_jql_entry(board_id)
+        snapshot = self.get_cached_snapshot(board_id)
+        if snapshot is None or not self._snapshot_matches(snapshot, entry):
+            try:
+                snapshot = self.refresh_board_snapshot(board_id)
+            except JiraTransportError:
+                if snapshot is None:
+                    raise
+        return list(snapshot.tasks)
+
+    def get_tasks_on_active_board(self, *, force_refresh: bool = False) -> list[Task]:
+        """Return active board tasks.
+
+        Fresh CLI processes hold no cache and transparently fetch; the
+        running app uses the non-blocking cached/refresh paths instead.
+        """
+        board_id = self.settings.active_jql
+        if force_refresh:
+            return self.get_tasks_by_board_id(board_id=board_id)
+
+        entry = next(
+            (entry for entry in self.settings.jqls if entry.id == board_id), None
         )
-
-        jql_result = get_jql(self.auth, board_jql_entry.jql)
-        issues = jql_result.get("issues", [])
-
-        tasks = []
-        for issue_data in issues:
-            task = self._jira_issue_to_task(issue_data, board_id=board_id)
-            tasks.append(task)
-
-        # Resolve dependencies
-        self._resolve_issue_dependencies(tasks, issues)
-        return tasks
-
-    def get_tasks_on_active_board(self) -> list[Task]:
-        """Execute active JQL query and convert issues to Tasks"""
-        return self.get_tasks_by_board_id(board_id=self.settings.active_jql)
+        snapshot = self.get_cached_snapshot(board_id)
+        if (
+            snapshot is not None
+            and entry is not None
+            and self._snapshot_matches(snapshot, entry)
+        ):
+            return list(snapshot.tasks)
+        return self.get_tasks_by_board_id(board_id=board_id)
 
     def get_task_by_id(self, task_id: int) -> Task | None:
         """Fetch a single Jira issue by ID"""
@@ -145,25 +369,45 @@ class JiraBackend(Backend):
         return tasks[0] if tasks else None
 
     def get_tasks_by_ids(self, task_ids: list[int]) -> list[Task]:
-        """Fetch specific Jira issues by ID"""
+        """Fetch specific issues, preferring cached snapshots.
+
+        Cache misses are fetched in a *single* batched JQL query instead of
+        one request per issue.
+        """
         if not task_ids:
             return []
 
-        # Fetch from Jira API
-        tasks = []
-        for task_id in task_ids:
-            try:
-                jql = f'id = "{task_id}"'
-                result = get_jql(self.auth, jql)
-                issues = result.get("issues", [])
-                if issues:
-                    task = self._jira_issue_to_task(issues[0])
-                    tasks.append(task)
-            except Exception as e:
-                print(f"Error fetching task {task_id}: {e}")
-                continue
+        wanted = list(dict.fromkeys(int(task_id) for task_id in task_ids))
+        found: dict[int, Task] = {}
 
-        return tasks
+        with self._cache_lock:
+            snapshots = list(self._snapshots.values())
+        for snapshot in snapshots:
+            for task in snapshot.tasks:
+                if task.task_id in wanted and task.task_id not in found:
+                    found[task.task_id] = task
+
+        remaining = [task_id for task_id in wanted if task_id not in found]
+        if remaining:
+            id_list = ", ".join(f'"{task_id}"' for task_id in remaining)
+            try:
+                result = search_issues_paged(
+                    self.auth, f"id in ({id_list})", self._search_options()
+                )
+            except JiraTransportError:
+                logger.debug(
+                    "Could not fetch issues %s from Jira", remaining, exc_info=True
+                )
+                result = None
+            if result is not None:
+                board_id = self.settings.active_jql
+                for issue_data in result.issues:
+                    task = self._jira_issue_to_task(
+                        issue_data, board_id=board_id
+                    )
+                    found.setdefault(task.task_id, task)
+
+        return [found[task_id] for task_id in wanted if task_id in found]
 
     # Helper methods
 
@@ -220,6 +464,10 @@ class JiraBackend(Backend):
             "updated": jira_issue.updated.isoformat() if jira_issue.updated else None,
             "resolution": jira_issue.resolution,
             "backend_source": "jira",
+            # Links pointing to issues outside the query scope, populated by
+            # _resolve_issue_dependencies; each entry is
+            # {"id", "key", "relation" ("blocks"/"depends_on"), "direction"}.
+            "unresolved_links": [],
         }
 
         return Task(
@@ -257,69 +505,108 @@ class JiraBackend(Backend):
         column_mapping = self._get_column_mapping_for_board(board_id)
         return column_mapping.get(status, 1)  # Default to first column
 
-    def _resolve_issue_dependencies(self, tasks: list[Task], issues: list[dict]):
-        """Resolve Jira issue links to task dependencies"""
-        # Build lookup for issue keys/IDs to tasks
-        key_to_task = {}
-        id_to_task = {}
+    @staticmethod
+    def _comparable_datetime(value: datetime | None) -> datetime | None:
+        """Normalize aware/naive datetimes to naive UTC for comparison."""
+        if value is None:
+            return None
+        if value.tzinfo is not None:
+            return value.astimezone(UTC).replace(tzinfo=None)
+        return value
 
-        for issue, task in zip(issues, tasks, strict=False):
-            key_to_task[issue["key"]] = task
-            id_to_task[issue["id"]] = task
+    def _resolve_issue_dependencies(
+        self, tasks: list[Task], issues: list[dict]
+    ) -> int:
+        """Resolve Jira issue links over the complete issue set.
 
-        # Process issue links
-        for issue, task in zip(issues, tasks, strict=False):
-            issue_links = issue.get("fields", {}).get("issuelinks", [])
+        Links whose target issue is not part of the fetched snapshot cannot
+        be represented by an in-board task id; they are recorded as
+        ``metadata["unresolved_links"]`` instead of being silently dropped.
+
+        Returns:
+            Number of unresolved links encountered.
+        """
+        key_to_task: dict[str, Task] = {}
+        id_to_task: dict[str, Task] = {}
+
+        for issue_data, task in zip(issues, tasks, strict=False):
+            if issue_data.get("key") is not None:
+                key_to_task[issue_data["key"]] = task
+            if issue_data.get("id") is not None:
+                id_to_task[str(issue_data["id"])] = task
+
+        unresolved_count = 0
+
+        def find_target(ref) -> Task | None:
+            if not isinstance(ref, dict):
+                return None
+            ref_id = ref.get("id")
+            if ref_id is not None:
+                target = id_to_task.get(str(ref_id))
+                if target is not None:
+                    return target
+            ref_key = ref.get("key")
+            if isinstance(ref_key, str):
+                return key_to_task.get(ref_key)
+            return None
+
+        def append_unique(values: list[int], value: int) -> None:
+            if value not in values:
+                values.append(value)
+
+        for issue_data, task in zip(issues, tasks, strict=False):
+            issue_links = (issue_data.get("fields") or {}).get("issuelinks", [])
 
             for link in issue_links:
                 link_type = link.get("type", {})
                 link_type_name = link_type.get("name", "").lower()
+                is_block = "block" in link_type_name
+                is_depend = "depend" in link_type_name
+                if not (is_block or is_depend):
+                    continue
+                relation = "blocks" if is_block else "depends_on"
 
-                # Handle outward links (current issue blocks/depends on other)
                 if "outwardIssue" in link:
-                    outward_issue = link["outwardIssue"]
-                    # outward_key = outward_issue.get("key")
-                    outward_id = outward_issue.get("id")
-
-                    # Check if it's a "blocks" or "depends on" relationship
-                    if "block" in link_type_name:
+                    outward_task = find_target(link["outwardIssue"])
+                    if outward_task is None:
+                        task.metadata["unresolved_links"].append(
+                            {
+                                "id": (link["outwardIssue"] or {}).get("id"),
+                                "key": (link["outwardIssue"] or {}).get("key"),
+                                "relation": relation,
+                                "direction": "outward",
+                            }
+                        )
+                        unresolved_count += 1
+                        continue
+                    if is_block:
                         # Current issue blocks the outward issue
-                        if outward_id and outward_id in id_to_task:
-                            outward_task = id_to_task[outward_id]
-                            if int(outward_task.task_id) not in task.blocking:
-                                task.blocking.append(int(outward_task.task_id))
-                    elif (
-                        "depend" in link_type_name
-                        and outward_id
-                        and outward_id in id_to_task
-                    ):
+                        append_unique(task.blocking, outward_task.task_id)
+                    else:
                         # Current issue depends on the outward issue
-                        outward_task = id_to_task[outward_id]
-                        if int(outward_task.task_id) not in task.blocked_by:
-                            task.blocked_by.append(int(outward_task.task_id))
+                        append_unique(task.blocked_by, outward_task.task_id)
 
-                # Handle inward links (other issue blocks/depends on current)
                 if "inwardIssue" in link:
-                    inward_issue = link["inwardIssue"]
-                    # inward_key = inward_issue.get("key")
-                    inward_id = inward_issue.get("id")
-
-                    # Check if it's a "blocks" or "depends on" relationship
-                    if "block" in link_type_name:
+                    inward_task = find_target(link["inwardIssue"])
+                    if inward_task is None:
+                        task.metadata["unresolved_links"].append(
+                            {
+                                "id": (link["inwardIssue"] or {}).get("id"),
+                                "key": (link["inwardIssue"] or {}).get("key"),
+                                "relation": relation,
+                                "direction": "inward",
+                            }
+                        )
+                        unresolved_count += 1
+                        continue
+                    if is_block:
                         # Inward issue blocks current issue
-                        if inward_id and inward_id in id_to_task:
-                            inward_task = id_to_task[inward_id]
-                            if int(inward_task.task_id) not in task.blocked_by:
-                                task.blocked_by.append(int(inward_task.task_id))
-                    elif (
-                        "depend" in link_type_name
-                        and inward_id
-                        and inward_id in id_to_task
-                    ):
+                        append_unique(task.blocked_by, inward_task.task_id)
+                    else:
                         # Inward issue depends on current issue
-                        inward_task = id_to_task[inward_id]
-                        if int(inward_task.task_id) not in task.blocking:
-                            task.blocking.append(int(inward_task.task_id))
+                        append_unique(task.blocking, inward_task.task_id)
+
+        return unresolved_count
 
     @property
     def active_board(self) -> Board | None:
@@ -365,11 +652,17 @@ class JiraBackend(Backend):
         """Update Jira issue status by finding a transition whose target
         status maps to the same column the task was moved to.
 
+        Carries the snapshot's remote ``updated`` watermark: if the issue
+        changed on the server after the snapshot was fetched, the move is
+        rejected with ``conflict=True`` so the UI can force a refresh
+        instead of transitioning stale state.
+
         Args:
             new_task: Task with updated column information
 
         Returns:
-            dict with 'success' (bool) and 'message' (str) keys
+            dict with 'success' (bool), optionally 'conflict' (bool) and
+            'message' (str) keys
         """
         # target_position / append_mode are sqlite-specific and intentionally ignored.
         _ = target_position, append_mode
@@ -382,6 +675,37 @@ class JiraBackend(Backend):
 
         board_id = self.active_board.board_id if self.active_board else None
         target_column = new_task.column
+        snapshot = (
+            self.get_cached_snapshot(board_id) if board_id is not None else None
+        )
+
+        try:
+            remote_state = get_issue_state(
+                self.auth, jira_key, self._search_options()
+            )
+        except JiraTransportError as e:
+            return {
+                "success": False,
+                "message": f"Failed to verify remote issue state: {e!s}",
+            }
+
+        remote_updated = self._comparable_datetime(remote_state.get("updated"))
+        snapshot_watermark = self._comparable_datetime(
+            snapshot.watermark if snapshot is not None else None
+        )
+        if (
+            remote_updated is not None
+            and snapshot_watermark is not None
+            and remote_updated > snapshot_watermark
+        ):
+            return {
+                "success": False,
+                "conflict": True,
+                "message": (
+                    f"{jira_key} changed on the server after the last refresh. "
+                    "Press r to reload before moving it."
+                ),
+            }
 
         try:
             transitions = get_transitions(self.auth, jira_key)
@@ -419,7 +743,14 @@ class JiraBackend(Backend):
                 "message": f"No transition available to column {target_column}. Available: {', '.join(available)}",
             }
 
-        return set_issue_status(self.auth, jira_key, transition_id)
+        result = set_issue_status(self.auth, jira_key, transition_id)
+        if result.get("success"):
+            result["watermark"] = (
+                remote_state["updated"].isoformat()
+                if remote_state.get("updated")
+                else None
+            )
+        return result
 
     def create_new_board(
         self, name: str, jql: str, column_mapping: dict[str, int] | None = None
@@ -436,11 +767,14 @@ class JiraBackend(Backend):
         raise NotImplementedError("Jira backend is read-only. Update boards in config.")
 
     def delete_board(self, board_id: int):
+        jql_to_delete = None
         for jql in self.settings.jqls:
             if board_id == jql.id:
                 jql_to_delete = jql
 
-        self.settings.jqls.remove(jql_to_delete)
+        if jql_to_delete is not None:
+            self.settings.jqls.remove(jql_to_delete)
+            self.invalidate_snapshot(board_id)
 
     def create_new_column(self, *args, **kwargs):
         raise NotImplementedError(

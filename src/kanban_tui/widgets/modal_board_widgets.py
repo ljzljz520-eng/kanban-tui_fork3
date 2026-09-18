@@ -77,7 +77,9 @@ class BoardListItem(ListItem):
             yield Rule(orientation="vertical")
             yield Label(f"Columns: {self.amount_columns}")
             yield Rule(orientation="vertical")
-            yield Label(f"Tasks: {self.amount_tasks}")
+            yield Label(
+                f"Tasks: {self.amount_tasks if self.amount_tasks is not None else '-'}"
+            )
             yield Rule(orientation="vertical")
             match self.next_due:
                 case 0:

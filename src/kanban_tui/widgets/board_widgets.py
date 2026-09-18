@@ -502,6 +502,21 @@ class KanbanBoard(HorizontalScroll):
             self.app.app_focus = True
             self.target_column = None
 
+            if result.get("conflict"):
+                # Remote issue moved past our snapshot watermark: do not
+                # transition stale state, force a generation-guarded refresh.
+                self.app.notify(
+                    title="Outdated board data",
+                    message=result.get(
+                        "message",
+                        "Issue changed on the server, refreshing the board",
+                    ),
+                    severity="warning",
+                    timeout=8,
+                )
+                self.app.action_refresh()
+                return
+
             self.app.notify(
                 title="Status Update Failed",
                 message=result.get("message", "Failed to update issue status"),
@@ -537,12 +552,17 @@ class KanbanBoard(HorizontalScroll):
 
         # Refresh all task cards to update dependency status immediately
         moved_task_id = self.selected_task.task_id
-        for task_card in self.query(TaskCard):
-            # Update the task data from the backend to get latest dependency status
-            updated_task = self.app.backend.get_task_by_id(task_card.task_.task_id)
-            if updated_task:
-                task_card.task_ = updated_task
-                task_card.refresh(recompose=True)
+        if self.app.config.backend.mode == Backends.JIRA:
+            # Do not issue one get_task_by_id request per card: the
+            # generation-guarded worker republishes the complete snapshot.
+            self.app.action_refresh()
+        else:
+            for task_card in self.query(TaskCard):
+                # Update the task data from the backend to get latest dependency status
+                updated_task = self.app.backend.get_task_by_id(task_card.task_.task_id)
+                if updated_task:
+                    task_card.task_ = updated_task
+                    task_card.refresh(recompose=True)
 
         # Restore focus to the moved task
         self.query_one(f"#taskcard_{moved_task_id}", TaskCard).focus()

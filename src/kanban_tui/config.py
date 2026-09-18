@@ -62,6 +62,12 @@ class JiraBackendSettings(BaseModel):
     auth_file_path: str = Field(default=AUTH_FILE.as_posix())
     jqls: list[JqlEntry] = Field(default_factory=list)
     active_jql: int = Field(default=1)
+    # Per request timeout in seconds
+    request_timeout: float = Field(default=30.0)
+    # Requested Jira page size (maxResults)
+    page_size: int = Field(default=100)
+    # Directory for last-known-good snapshot cache; empty -> default data dir
+    snapshot_cache_path: str = Field(default="")
 
 
 class SqliteBackendSettings(BaseModel):

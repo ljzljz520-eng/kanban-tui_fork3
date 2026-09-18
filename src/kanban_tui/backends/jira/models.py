@@ -1,7 +1,14 @@
+from __future__ import annotations
+
+from collections.abc import Mapping
+from dataclasses import dataclass
 from datetime import datetime
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from pydantic import BaseModel, Field
+
+if TYPE_CHECKING:
+    from kanban_tui.classes.task import Task
 
 
 class JiraUser(BaseModel):
@@ -211,3 +218,39 @@ class JiraProject(BaseModel):
     name: str
     id: str
     projectTypeKey: str = "software"
+
+
+@dataclass(frozen=True)
+class JiraBoardSnapshot:
+    """Immutable, fully verified result set for one board (JQL + mapping).
+
+    A snapshot is published only after *all* pages have been collected and
+    ``total`` has been verified, so consumers never see partially fetched
+    boards. Dependency resolution runs on the complete issue set.
+
+    Attributes:
+        board_id: Virtual board id (the JQL entry id).
+        jql: JQL the issues were fetched with (identity/staleness check).
+        column_mapping: Status-to-column mapping used for this snapshot.
+        tasks: Converted, dependency-resolved tasks.
+        total: Server-reported total issue count (``None`` on Cloud cursor
+            pagination).
+        pages_fetched: Number of pages consumed from Jira.
+        watermark: Newest remote ``updated`` timestamp across the issues.
+        fetched_at: Local publication time.
+        unresolved_link_count: Issue links pointing outside the query scope.
+    """
+
+    board_id: int
+    jql: str
+    column_mapping: Mapping[str, int]
+    tasks: tuple[Task, ...]
+    total: int | None
+    pages_fetched: int
+    watermark: datetime | None
+    fetched_at: datetime
+    unresolved_link_count: int = 0
+
+    @property
+    def is_complete(self) -> bool:
+        return self.total is None or len(self.tasks) == self.total

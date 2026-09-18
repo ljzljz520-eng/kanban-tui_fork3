@@ -19,7 +19,7 @@ from textual.widget import Widget
 from textual.widgets import Button, Input, Label, ListItem, ListView, Static
 
 from kanban_tui.backends.jira.jira_api import (
-    get_jql,
+    get_jql_async,
     get_transitions_async,
 )
 
@@ -186,8 +186,9 @@ class ModalNewJiraBoardScreen(ModalScreen):
         self.query_exactly_one("#btn_check_jql", Button).disabled = True
 
         try:
-            # Execute JQL query
-            result = get_jql(self.app.backend.auth, jql)
+            # Execute JQL query (single page is enough to validate the JQL;
+            # run via executor so the event loop is not blocked)
+            result = await get_jql_async(self.app.backend.auth, jql)
             issues = result.get("issues", [])
 
             if not issues:
